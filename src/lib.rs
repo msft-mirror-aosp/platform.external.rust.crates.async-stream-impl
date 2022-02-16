@@ -1,126 +1,47 @@
 extern crate proc_macro;
 use proc_macro::TokenStream;
-use proc_macro2::{Group, TokenStream as TokenStream2, TokenTree};
+use proc_macro2::{Delimiter, Group, TokenStream as TokenStream2, TokenTree};
 use quote::quote;
-use syn::parse::{Parse, ParseStream, Parser, Result};
 use syn::visit_mut::VisitMut;
 
-struct Scrub<'a> {
-    /// Whether the stream is a try stream.
+struct Scrub {
+    is_xforming: bool,
     is_try: bool,
-    /// The unit expression, `()`.
     unit: Box<syn::Expr>,
-    has_yielded: bool,
-    crate_path: &'a TokenStream2,
+    num_yield: u32,
 }
 
-fn parse_input(input: TokenStream) -> syn::Result<(TokenStream2, Vec<syn::Stmt>)> {
-    let mut input = TokenStream2::from(input).into_iter();
-    let crate_path = match input.next().unwrap() {
-        TokenTree::Group(group) => group.stream(),
-        _ => panic!(),
-    };
-    let stmts = syn::Block::parse_within.parse2(replace_for_await(input))?;
-    Ok((crate_path, stmts))
+fn parse_input(input: TokenStream) -> syn::Result<Vec<syn::Stmt>> {
+    let input = replace_for_await(input.into());
+    // syn does not provide a way to parse `Vec<Stmt>` directly from `TokenStream`,
+    // so wrap input in a brace and then parse it as a block.
+    let input = TokenStream2::from(TokenTree::Group(Group::new(Delimiter::Brace, input)));
+    let syn::Block { stmts, .. } = syn::parse2(input)?;
+
+    Ok(stmts)
 }
 
-impl<'a> Scrub<'a> {
-    fn new(is_try: bool, crate_path: &'a TokenStream2) -> Self {
-        Self {
-            is_try,
-            unit: syn::parse_quote!(()),
-            has_yielded: false,
-            crate_path,
-        }
-    }
-}
-
-struct Partial<T>(T, TokenStream2);
-
-impl<T: Parse> Parse for Partial<T> {
-    fn parse(input: ParseStream) -> Result<Self> {
-        Ok(Partial(input.parse()?, input.parse()?))
-    }
-}
-
-fn visit_token_stream_impl(
-    visitor: &mut Scrub<'_>,
-    tokens: TokenStream2,
-    modified: &mut bool,
-    out: &mut TokenStream2,
-) {
-    use quote::ToTokens;
-    use quote::TokenStreamExt;
-
-    let mut tokens = tokens.into_iter().peekable();
-    while let Some(tt) = tokens.next() {
-        match tt {
-            TokenTree::Ident(i) if i == "yield" => {
-                let stream = std::iter::once(TokenTree::Ident(i)).chain(tokens).collect();
-                match syn::parse2(stream) {
-                    Ok(Partial(yield_expr, rest)) => {
-                        let mut expr = syn::Expr::Yield(yield_expr);
-                        visitor.visit_expr_mut(&mut expr);
-                        expr.to_tokens(out);
-                        *modified = true;
-                        tokens = rest.into_iter().peekable();
-                    }
-                    Err(e) => {
-                        out.append_all(&mut e.to_compile_error().into_iter());
-                        *modified = true;
-                        return;
-                    }
-                }
-            }
-            TokenTree::Ident(i) if i == "stream" || i == "try_stream" => {
-                out.append(TokenTree::Ident(i));
-                match tokens.peek() {
-                    Some(TokenTree::Punct(p)) if p.as_char() == '!' => {
-                        out.extend(tokens.next()); // !
-                        if let Some(TokenTree::Group(_)) = tokens.peek() {
-                            out.extend(tokens.next()); // { .. } or [ .. ] or ( .. )
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            TokenTree::Group(group) => {
-                let mut content = group.stream();
-                *modified |= visitor.visit_token_stream(&mut content);
-                let mut new = Group::new(group.delimiter(), content);
-                new.set_span(group.span());
-                out.append(new);
-            }
-            other => out.append(other),
-        }
-    }
-}
-
-impl Scrub<'_> {
-    fn visit_token_stream(&mut self, tokens: &mut TokenStream2) -> bool {
-        let (mut out, mut modified) = (TokenStream2::new(), false);
-        visit_token_stream_impl(self, tokens.clone(), &mut modified, &mut out);
-
-        if modified {
-            *tokens = out;
-        }
-
-        modified
-    }
-}
-
-impl VisitMut for Scrub<'_> {
+impl VisitMut for Scrub {
     fn visit_expr_mut(&mut self, i: &mut syn::Expr) {
+        if !self.is_xforming {
+            syn::visit_mut::visit_expr_mut(self, i);
+            return;
+        }
+
         match i {
             syn::Expr::Yield(yield_expr) => {
-                self.has_yielded = true;
+                self.num_yield += 1;
 
-                let value_expr = yield_expr.expr.as_ref().unwrap_or(&self.unit);
+                let value_expr = if let Some(ref e) = yield_expr.expr {
+                    e
+                } else {
+                    &self.unit
+                };
 
                 // let ident = &self.yielder;
 
                 *i = if self.is_try {
-                    syn::parse_quote! { __yield_tx.send(::core::result::Result::Ok(#value_expr)).await }
+                    syn::parse_quote! { __yield_tx.send(Ok(#value_expr)).await }
                 } else {
                     syn::parse_quote! { __yield_tx.send(#value_expr).await }
                 };
@@ -132,16 +53,19 @@ impl VisitMut for Scrub<'_> {
 
                 *i = syn::parse_quote! {
                     match #e {
-                        ::core::result::Result::Ok(v) => v,
-                        ::core::result::Result::Err(e) => {
-                            __yield_tx.send(::core::result::Result::Err(e.into())).await;
+                        Ok(v) => v,
+                        Err(e) => {
+                            __yield_tx.send(Err(e.into())).await;
                             return;
                         }
                     }
                 };
             }
             syn::Expr::Closure(_) | syn::Expr::Async(_) => {
-                // Don't transform inner closures or async blocks.
+                let prev = self.is_xforming;
+                self.is_xforming = false;
+                syn::visit_mut::visit_expr_mut(self, i);
+                self.is_xforming = prev;
             }
             syn::Expr::ForLoop(expr) => {
                 syn::visit_mut::visit_expr_for_loop_mut(self, expr);
@@ -164,7 +88,6 @@ impl VisitMut for Scrub<'_> {
                     return;
                 }
 
-                let crate_path = self.crate_path;
                 *i = syn::parse_quote! {{
                     let mut __pinned = #expr;
                     let mut __pinned = unsafe {
@@ -172,7 +95,7 @@ impl VisitMut for Scrub<'_> {
                     };
                     #label
                     loop {
-                        let #pat = match #crate_path::reexport::next(&mut __pinned).await {
+                        let #pat = match ::async_stream::reexport::next(&mut __pinned).await {
                             ::core::option::Option::Some(e) => e,
                             ::core::option::Option::None => break,
                         };
@@ -184,50 +107,70 @@ impl VisitMut for Scrub<'_> {
         }
     }
 
-    fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
-        let mac_ident = mac.path.segments.last().map(|p| &p.ident);
-        if mac_ident.map_or(false, |i| i == "stream" || i == "try_stream") {
-            return;
-        }
-
-        self.visit_token_stream(&mut mac.tokens);
-    }
-
     fn visit_item_mut(&mut self, i: &mut syn::Item) {
-        // Recurse into macros but otherwise don't transform inner items.
-        if let syn::Item::Macro(i) = i {
-            self.visit_macro_mut(&mut i.mac);
-        }
+        let prev = self.is_xforming;
+        self.is_xforming = false;
+        syn::visit_mut::visit_item_mut(self, i);
+        self.is_xforming = prev;
     }
 }
 
-/// The first token tree in the stream must be a group containing the path to the `async-stream`
-/// crate.
+/// Asynchronous stream
+///
+/// See [crate](index.html) documentation for more details.
+///
+/// # Examples
+///
+/// ```rust
+/// use async_stream::stream;
+///
+/// use futures_util::pin_mut;
+/// use futures_util::stream::StreamExt;
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let s = stream! {
+///         for i in 0..3 {
+///             yield i;
+///         }
+///     };
+///
+///     pin_mut!(s); // needed for iteration
+///
+///     while let Some(value) = s.next().await {
+///         println!("got {}", value);
+///     }
+/// }
+/// ```
 #[proc_macro]
-#[doc(hidden)]
-pub fn stream_inner(input: TokenStream) -> TokenStream {
-    let (crate_path, mut stmts) = match parse_input(input) {
+pub fn stream(input: TokenStream) -> TokenStream {
+    let mut stmts = match parse_input(input) {
         Ok(x) => x,
         Err(e) => return e.to_compile_error().into(),
     };
 
-    let mut scrub = Scrub::new(false, &crate_path);
+    let mut scrub = Scrub {
+        is_xforming: true,
+        is_try: false,
+        unit: syn::parse_quote!(()),
+        num_yield: 0,
+    };
 
-    for mut stmt in &mut stmts {
+    for mut stmt in &mut stmts[..] {
         scrub.visit_stmt_mut(&mut stmt);
     }
 
-    let dummy_yield = if scrub.has_yielded {
-        None
-    } else {
+    let dummy_yield = if scrub.num_yield == 0 {
         Some(quote!(if false {
             __yield_tx.send(()).await;
         }))
+    } else {
+        None
     };
 
     quote!({
-        let (mut __yield_tx, __yield_rx) = #crate_path::yielder::pair();
-        #crate_path::AsyncStream::new(__yield_rx, async move {
+        let (mut __yield_tx, __yield_rx) = ::async_stream::yielder::pair();
+        ::async_stream::AsyncStream::new(__yield_rx, async move {
             #dummy_yield
             #(#stmts)*
         })
@@ -235,33 +178,64 @@ pub fn stream_inner(input: TokenStream) -> TokenStream {
     .into()
 }
 
-/// The first token tree in the stream must be a group containing the path to the `async-stream`
-/// crate.
+/// Asynchronous fallible stream
+///
+/// See [crate](index.html) documentation for more details.
+///
+/// # Examples
+///
+/// ```rust
+/// use tokio::net::{TcpListener, TcpStream};
+///
+/// use async_stream::try_stream;
+/// use futures_core::stream::Stream;
+///
+/// use std::io;
+/// use std::net::SocketAddr;
+///
+/// fn bind_and_accept(addr: SocketAddr)
+///     -> impl Stream<Item = io::Result<TcpStream>>
+/// {
+///     try_stream! {
+///         let mut listener = TcpListener::bind(addr).await?;
+///
+///         loop {
+///             let (stream, addr) = listener.accept().await?;
+///             println!("received on {:?}", addr);
+///             yield stream;
+///         }
+///     }
+/// }
+/// ```
 #[proc_macro]
-#[doc(hidden)]
-pub fn try_stream_inner(input: TokenStream) -> TokenStream {
-    let (crate_path, mut stmts) = match parse_input(input) {
+pub fn try_stream(input: TokenStream) -> TokenStream {
+    let mut stmts = match parse_input(input) {
         Ok(x) => x,
         Err(e) => return e.to_compile_error().into(),
     };
 
-    let mut scrub = Scrub::new(true, &crate_path);
+    let mut scrub = Scrub {
+        is_xforming: true,
+        is_try: true,
+        unit: syn::parse_quote!(()),
+        num_yield: 0,
+    };
 
-    for mut stmt in &mut stmts {
+    for mut stmt in &mut stmts[..] {
         scrub.visit_stmt_mut(&mut stmt);
     }
 
-    let dummy_yield = if scrub.has_yielded {
-        None
-    } else {
+    let dummy_yield = if scrub.num_yield == 0 {
         Some(quote!(if false {
             __yield_tx.send(()).await;
         }))
+    } else {
+        None
     };
 
     quote!({
-        let (mut __yield_tx, __yield_rx) = #crate_path::yielder::pair();
-        #crate_path::AsyncStream::new(__yield_rx, async move {
+        let (mut __yield_tx, __yield_rx) = ::async_stream::yielder::pair();
+        ::async_stream::AsyncStream::new(__yield_rx, async move {
             #dummy_yield
             #(#stmts)*
         })
@@ -269,8 +243,7 @@ pub fn try_stream_inner(input: TokenStream) -> TokenStream {
     .into()
 }
 
-/// Replace `for await` with `#[await] for`, which will be later transformed into a `next` loop.
-fn replace_for_await(input: impl IntoIterator<Item = TokenTree>) -> TokenStream2 {
+fn replace_for_await(input: TokenStream2) -> TokenStream2 {
     let mut input = input.into_iter().peekable();
     let mut tokens = Vec::new();
 
