@@ -115,6 +115,8 @@ impl VisitMut for Scrub<'_> {
             syn::Expr::Yield(yield_expr) => {
                 self.has_yielded = true;
 
+                syn::visit_mut::visit_expr_yield_mut(self, yield_expr);
+
                 let value_expr = yield_expr.expr.as_ref().unwrap_or(&self.unit);
 
                 // let ident = &self.yielder;
@@ -213,8 +215,8 @@ pub fn stream_inner(input: TokenStream) -> TokenStream {
 
     let mut scrub = Scrub::new(false, &crate_path);
 
-    for mut stmt in &mut stmts {
-        scrub.visit_stmt_mut(&mut stmt);
+    for stmt in &mut stmts {
+        scrub.visit_stmt_mut(stmt);
     }
 
     let dummy_yield = if scrub.has_yielded {
@@ -247,8 +249,8 @@ pub fn try_stream_inner(input: TokenStream) -> TokenStream {
 
     let mut scrub = Scrub::new(true, &crate_path);
 
-    for mut stmt in &mut stmts {
-        scrub.visit_stmt_mut(&mut stmt);
+    for stmt in &mut stmts {
+        scrub.visit_stmt_mut(stmt);
     }
 
     let dummy_yield = if scrub.has_yielded {
