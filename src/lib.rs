@@ -148,7 +148,7 @@ impl VisitMut for Scrub<'_> {
             syn::Expr::ForLoop(expr) => {
                 syn::visit_mut::visit_expr_for_loop_mut(self, expr);
                 // TODO: Should we allow other attributes?
-                if expr.attrs.len() != 1 || !expr.attrs[0].path.is_ident("await") {
+                if expr.attrs.len() != 1 || !expr.attrs[0].meta.path().is_ident(AWAIT_ATTR_NAME) {
                     return;
                 }
                 let syn::ExprForLoop {
@@ -160,11 +160,7 @@ impl VisitMut for Scrub<'_> {
                     ..
                 } = expr;
 
-                let attr = attrs.pop().unwrap();
-                if let Err(e) = syn::parse2::<syn::parse::Nothing>(attr.tokens) {
-                    *i = syn::parse2(e.to_compile_error()).unwrap();
-                    return;
-                }
+                attrs.pop().unwrap();
 
                 let crate_path = self.crate_path;
                 *i = syn::parse_quote! {{
@@ -174,7 +170,7 @@ impl VisitMut for Scrub<'_> {
                     };
                     #label
                     loop {
-                        let #pat = match #crate_path::reexport::next(&mut __pinned).await {
+                        let #pat = match #crate_path::__private::next(&mut __pinned).await {
                             ::core::option::Option::Some(e) => e,
                             ::core::option::Option::None => break,
                         };
@@ -228,8 +224,8 @@ pub fn stream_inner(input: TokenStream) -> TokenStream {
     };
 
     quote!({
-        let (mut __yield_tx, __yield_rx) = #crate_path::yielder::pair();
-        #crate_path::AsyncStream::new(__yield_rx, async move {
+        let (mut __yield_tx, __yield_rx) = unsafe { #crate_path::__private::yielder::pair() };
+        #crate_path::__private::AsyncStream::new(__yield_rx, async move {
             #dummy_yield
             #(#stmts)*
         })
@@ -262,14 +258,18 @@ pub fn try_stream_inner(input: TokenStream) -> TokenStream {
     };
 
     quote!({
-        let (mut __yield_tx, __yield_rx) = #crate_path::yielder::pair();
-        #crate_path::AsyncStream::new(__yield_rx, async move {
+        let (mut __yield_tx, __yield_rx) = unsafe { #crate_path::__private::yielder::pair() };
+        #crate_path::__private::AsyncStream::new(__yield_rx, async move {
             #dummy_yield
             #(#stmts)*
         })
     })
     .into()
 }
+
+// syn 2.0 wont parse `#[await] for x in xs {}`
+// because `await` is a keyword, use `await_` instead
+const AWAIT_ATTR_NAME: &str = "await_";
 
 /// Replace `for await` with `#[await] for`, which will be later transformed into a `next` loop.
 fn replace_for_await(input: impl IntoIterator<Item = TokenTree>) -> TokenStream2 {
@@ -281,6 +281,8 @@ fn replace_for_await(input: impl IntoIterator<Item = TokenTree>) -> TokenStream2
             TokenTree::Ident(ident) => {
                 match input.peek() {
                     Some(TokenTree::Ident(next)) if ident == "for" && next == "await" => {
+                        let next_span = next.span();
+                        let next = syn::Ident::new(AWAIT_ATTR_NAME, next_span);
                         tokens.extend(quote!(#[#next]));
                         let _ = input.next();
                     }
@@ -290,7 +292,9 @@ fn replace_for_await(input: impl IntoIterator<Item = TokenTree>) -> TokenStream2
             }
             TokenTree::Group(group) => {
                 let stream = replace_for_await(group.stream());
-                tokens.push(Group::new(group.delimiter(), stream).into());
+                let mut new_group = Group::new(group.delimiter(), stream);
+                new_group.set_span(group.span());
+                tokens.push(new_group.into());
             }
             _ => tokens.push(token),
         }
